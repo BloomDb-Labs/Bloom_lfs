@@ -1,0 +1,20 @@
+[package]
+name = "llama"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.11.1"
+rand = { version = "0.8" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] } # "full" includes macros, time, and rt features
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "flush_buffer"
+harness = false
+
+[profile.profiling]
+inherits = "release"
+debug = true
