@@ -19,3 +19,9 @@ src/
 |  |    ├─ flush_buffers
 |  |    ├─ input_output # io_uring
 └─ 
+
+
+Delta
+Acess method should be able to define the structure of there deltas using
+Access methods are defined by the access...methods. A bit vague. What we care about 
+is the linking to other deltas and pages?

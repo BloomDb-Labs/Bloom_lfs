@@ -46,7 +46,6 @@ use std::{
 /// overlapping regions.
 #[derive(Debug)]
 pub(crate) struct Buffer {
-
     buffer: UnsafeCell<Box<[u8]>>,
 }
 
@@ -71,7 +70,7 @@ const WRITER_ONE: usize = 1 << 2;
 const FLUSH_IN_PROGRESS_BIT: usize = 1 << 1;
 
 /// Errors a thread may encounter while managing the buffer.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum BufferError {
     /// The payload exceeds the remaining capacity of the flush buffer.
     InsufficientSpace,
@@ -96,7 +95,7 @@ pub enum BufferError {
 }
 
 /// Successful operation outcomes.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum BufferMsg {
     /// Buffer has been sealed.
     SealedBuffer,
@@ -149,12 +148,12 @@ unsafe impl Send for FlushBuffer {}
 unsafe impl Sync for FlushBuffer {}
 
 impl FlushBuffer {
-    pub(crate) fn new_buffer(buffer_number: usize) -> FlushBuffer {
+    pub(crate) fn new_buffer(buffer_number: usize, size: usize) -> FlushBuffer {
         Self {
             state: AtomicUsize::new(0),
             current_offset: AtomicUsize::new(0),
             buf: Arc::new(Buffer {
-                buffer: UnsafeCell::new(Box::new(vec![0u8; BUFFER_SIZE]).into_boxed_slice()),
+                buffer: UnsafeCell::new(Box::new(vec![0u8; size]).into_boxed_slice()),
             }),
             address: BUFFER_SIZE * buffer_number,
             pos: buffer_number,
@@ -206,7 +205,7 @@ impl FlushBuffer {
     /// [`FlushBufferRing::rotate_after_seal`], making seal + rotate one logical atomic step.  No other thread may rotate.
     pub(crate) fn write_all(
         &self,
-        payload: &mut [u8],
+        payload: &[u8],
         parent: &FlushBufferRing,
     ) -> Result<BufferMsg, BufferError> {
         // CAS writer increment
@@ -238,6 +237,10 @@ impl FlushBuffer {
             // concurently. Under the assumption that threads spent most of there time writing
             // to buffers rather than prying atomic counters out of each of their hands, this is fine.
             // and an acceptable tradeoff for the correctness it gurantees.
+
+            // OR maybe I'm being lazy....
+            //
+            // Open Issue: Replace with a non looping CAS method
             if self
                 .state
                 .compare_exchange(state, new, Ordering::AcqRel, Ordering::Acquire)
@@ -391,9 +394,9 @@ pub(crate) struct FlushBufferRing {
 }
 
 impl FlushBufferRing {
-    pub(crate) fn with_buffer_amount(num_of_buffer: usize) -> FlushBufferRing {
+    pub(crate) fn with_buffer_amount(num_of_buffer: usize, buffer_size: usize) -> FlushBufferRing {
         let buffers: Vec<Arc<FlushBuffer>> = (0..num_of_buffer)
-            .map(|i| Arc::new(FlushBuffer::new_buffer(i)))
+            .map(|i| Arc::new(FlushBuffer::new_buffer(i, buffer_size)))
             .collect();
 
         let buffers = Pin::new(buffers.into_boxed_slice());
@@ -417,7 +420,7 @@ impl FlushBufferRing {
     ///   thread can register as a writer after the sealed bit is set.
 
     //  Currently guranteed to write data into a buffer; returning a Result<> may be uneeded
-    pub(crate) async fn put(&self, payload: &mut [u8]) -> Result<BufferMsg, BufferError> {
+    pub(crate) async fn put(&self, payload: &[u8]) -> Result<BufferMsg, BufferError> {
         loop {
             let current = unsafe {
                 self.current_buffer
@@ -466,6 +469,11 @@ impl FlushBufferRing {
                     continue;
                 }
 
+                Err(BufferError::RingExhausted) => {
+                    // Return out the loop;
+                    return Err(BufferError::RingExhausted);
+                }
+
                 _ => return Err(BufferError::InvalidState),
             }
         }
@@ -494,8 +502,8 @@ impl FlushBufferRing {
 
         for _ in 0..ring_len {
             let raw = self.next_index.fetch_add(1, Ordering::AcqRel);
-            let next_index = raw % ring_len;
 
+            let next_index = raw % ring_len;
             let new_buffer = &self.ring[next_index];
 
             if new_buffer.is_available() {
@@ -531,12 +539,47 @@ impl FlushBufferRing {
     }
 }
 
-// ============================================================================
+// Transaction reservations
+pub(crate) struct Reservation<'a> {
+    pub(crate) current_buffer: Arc<&'a FlushBuffer>,
+    pub(crate) offset: Option<usize>,
+    pub(crate) error: Option<BufferError>,
+}
+
+pub struct RingBufferConfig {
+    ring_size: usize,
+    buffer_size: usize,
+    transactions: bool,
+}
+
+impl RingBufferConfig {
+    pub(crate) fn with_ring_size(ring_size: usize) -> Self {
+        Self {
+            ring_size,
+            buffer_size: BUFFER_SIZE,
+            transactions: false,
+        }
+    }
+
+    pub(crate) fn with_buffer_capacity(&mut self, size: usize) -> &mut Self {
+        self.buffer_size = size;
+        self
+    }
+
+    pub(crate) fn with_transactions(&mut self) -> &mut Self {
+        self.transactions = true;
+        self
+    }
+}
+
+// ==========================================================================+==
 //  Tests
 // ─============================================================================
 
 #[cfg(test)]
 mod tests {
+    use crate::data_objects::{Delta, UpdateDelta, FOUR_KB_PAGE};
+
     use super::*;
 
     use std::{
@@ -611,7 +654,8 @@ mod tests {
     // After implementing async flushing, we can stress test this even further
     #[tokio::test]
     async fn single_threaded_offset_uniqueness() {
-        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE);
+        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE, BUFFER_SIZE);
+
         let mut rng = Lcg::new(0);
         let mut writes = 0usize;
         let mut flushes = 0usize;
@@ -646,7 +690,7 @@ mod tests {
     /// A single BUFFER_SIZE payload must be accepted exactly once.
     #[tokio::test]
     async fn exact_fill() {
-        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE);
+        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE, BUFFER_SIZE);
         let mut payload = make_payload("FILL", BUFFER_SIZE);
         match ring.put(&mut payload).await {
             Ok(BufferMsg::SuccessfullWrite) | Ok(BufferMsg::SuccessfullWriteFlush) => {}
@@ -657,7 +701,7 @@ mod tests {
     /// reserve_space on an already-sealed buffer must return EncounteredSealedBuffer.
     #[tokio::test]
     async fn reserve_on_sealed_buffer_returns_error() {
-        let buf = FlushBuffer::new_buffer(0);
+        let buf = FlushBuffer::new_buffer(0, BUFFER_SIZE);
         buf.set_sealed_bit_true().unwrap();
         assert!(matches!(
             buf.reserve_space(16),
@@ -668,7 +712,7 @@ mod tests {
     /// Sealing an already-sealed buffer must return the COMPEX error.
     #[tokio::test]
     async fn double_seal_returns_error() {
-        let buf = FlushBuffer::new_buffer(0);
+        let buf = FlushBuffer::new_buffer(0, BUFFER_SIZE);
         buf.set_sealed_bit_true().unwrap();
         assert!(matches!(
             buf.set_sealed_bit_true(),
@@ -679,7 +723,7 @@ mod tests {
     /// Unsealing an already-unsealed buffer must return the COMPEX error.
     #[tokio::test]
     async fn unseal_unsealed_returns_error() {
-        let buf = FlushBuffer::new_buffer(0);
+        let buf = FlushBuffer::new_buffer(0, BUFFER_SIZE);
         assert!(matches!(
             buf.set_sealed_bit_false(),
             Err(BufferError::EncounteredUnSealedBufferDuringCOMPEX)
@@ -689,13 +733,13 @@ mod tests {
     /// A reserve that exactly hits the boundary must succeed; one byte over must fail.
     #[tokio::test]
     async fn boundary_reserve() {
-        let buf = FlushBuffer::new_buffer(0);
+        let buf = FlushBuffer::new_buffer(0, BUFFER_SIZE);
         // Fill up to BUFFER_SIZE - 1
         buf.current_offset.store(BUFFER_SIZE - 1, Ordering::Relaxed);
         // One byte fits exactly
         assert!(buf.reserve_space(1).is_ok());
         // Reset and try one byte over capacity
-        let buf2 = FlushBuffer::new_buffer(0);
+        let buf2 = FlushBuffer::new_buffer(0, BUFFER_SIZE);
         buf2.current_offset.store(BUFFER_SIZE, Ordering::Relaxed);
         assert!(matches!(
             buf2.reserve_space(1),
@@ -705,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_threaded_stress() {
-        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE);
+        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE, BUFFER_SIZE);
         let mut writes = 0usize;
         let mut flushes = 0usize;
         let mut rng = Lcg::new(0x1234_5678);
@@ -734,76 +778,124 @@ mod tests {
         );
     }
     // ==========================================================================
-    // Multi-Threaded Test
+    // Multi-Threaded Stress Tests
     // ==========================================================================
+
     const NUM_THREADS_LARGE: usize = 8;
     const NUM_THREADS_MEDIUM: usize = 4;
     const NUM_THREADS_SMALL: usize = 2;
-    #[tokio::test]
 
-    async fn multi_threeaded_test_small() {
-        let _ = multi_threaded_stress_helper(NUM_THREADS_SMALL);
-    }
     #[tokio::test]
-
-    async fn multi_threeaded_test_medium() {
-        let _ = multi_threaded_stress_helper(NUM_THREADS_MEDIUM);
+    async fn multi_threaded_test_small() {
+        multi_threaded_stress_helper(NUM_THREADS_SMALL).await;
     }
+
     #[tokio::test]
-
-    async fn multi_threeaded_test_large() {
-        let _ = multi_threaded_stress_helper(NUM_THREADS_LARGE);
+    async fn multi_threaded_test_medium() {
+        multi_threaded_stress_helper(NUM_THREADS_MEDIUM).await;
     }
-    async fn multi_threaded_stress_helper(threads: usize) {
-        let ring = Arc::new(FlushBufferRing::with_buffer_amount(RING_SIZE * 2));
-        let writes = Arc::new(AtomicUsize::new(0));
-        let flushes = Arc::new(AtomicUsize::new(0));
+
+    #[tokio::test]
+    async fn multi_threaded_test_large() {
+        multi_threaded_stress_helper(NUM_THREADS_LARGE).await;
+    }
+
+    async fn multi_threaded_stress_helper(num_threads: usize) {
+        let ring = Arc::new(FlushBufferRing::with_buffer_amount(
+            RING_SIZE * 2,
+            BUFFER_SIZE,
+        ));
+
+        // Barrier ensures all OS threads enter the ring simultaneously,
+        // maximising the seal/rotate race.
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let total_writes = Arc::new(AtomicUsize::new(0));
+        let total_flushes = Arc::new(AtomicUsize::new(0));
         let start = Instant::now();
 
-        let handles: Vec<_> = (0..threads)
+        let handles: Vec<thread::JoinHandle<()>> = (0..num_threads)
             .map(|tid| {
                 let ring = Arc::clone(&ring);
-                let writes = Arc::clone(&writes);
-                let flushes = Arc::clone(&flushes);
-                let seed = 0x1234_5678_u64.wrapping_add(tid as u64 * 0xDEAD_CAFE);
-                thread::spawn(async move || {
-                    let mut rng = Lcg::new(seed);
-                    for op in 0..OPS_PER_THREAD {
-                        let size = SIZES[rng.next_usize(SIZES.len())];
-                        if size > BUFFER_SIZE {
-                            continue;
-                        }
-                        let mut payload = make_payload(&format!("T{tid}:O{op:04}"), size);
-                        match ring.put(&mut payload).await {
-                            Ok(BufferMsg::SuccessfullWrite) => {
-                                writes.fetch_add(1, Ordering::Relaxed);
+                let barrier = Arc::clone(&barrier);
+                let total_writes = Arc::clone(&total_writes);
+                let total_flushes = Arc::clone(&total_flushes);
+
+                // Unique seed per thread so payloads don't collide.
+                let seed = 0x1234_5678_u64
+                    .wrapping_add(tid as u64)
+                    .wrapping_mul(0xDEAD_CAFE);
+
+                thread::spawn(move || {
+                    // Each OS thread drives its own single-threaded Tokio runtime.
+                    // This gives true parallelism — OS threads preempt each other
+                    // mid-CAS, which is exactly the pressure we want on the
+                    // seal/rotate path.
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build runtime");
+
+                    rt.block_on(async move {
+                        let mut rng = Lcg::new(seed);
+                        let mut local_writes = 0usize;
+                        let mut local_flushes = 0usize;
+
+                        // All threads release here so they hammer the ring at the
+                        // same instant rather than staggering their start times.
+                        barrier.wait();
+
+                        for op in 0..OPS_PER_THREAD {
+                            let size = SIZES[rng.next_usize(SIZES.len())];
+
+                            // Guard: the ring cannot accept payloads larger than
+                            // BUFFER_SIZE regardless of how many buffers it has.
+                            if size > BUFFER_SIZE {
+                                continue;
                             }
-                            Ok(BufferMsg::SuccessfullWriteFlush) => {
-                                writes.fetch_add(1, Ordering::Relaxed);
-                                flushes.fetch_add(1, Ordering::Relaxed);
+
+                            let mut payload = make_payload(&format!("T{tid}:O{op:04}"), size);
+
+                            match ring.put(&mut payload).await {
+                                Ok(BufferMsg::SuccessfullWrite) => {
+                                    local_writes += 1;
+                                }
+                                Ok(BufferMsg::SuccessfullWriteFlush) => {
+                                    local_writes += 1;
+                                    local_flushes += 1;
+                                }
+                                // Every other variant is a bug — surface it loudly.
+                                other => {
+                                    panic!("thread {tid} op {op}: unexpected result {other:?}")
+                                }
                             }
-                            other => panic!("thread {tid} op {op}: unexpected {other:?}"),
                         }
-                    }
+
+                        // Batch the atomic increments — one pair per thread rather
+                        // than one per op keeps the hot path clean.
+                        total_writes.fetch_add(local_writes, Ordering::Relaxed);
+                        total_flushes.fetch_add(local_flushes, Ordering::Relaxed);
+                    });
                 })
             })
             .collect();
 
-        for h in handles {
-            let _ =   h.join().expect("worker panicked");
+        // Join every OS thread; propagate panics from worker threads.
+        for (tid, handle) in handles.into_iter().enumerate() {
+            handle
+                .join()
+                .unwrap_or_else(|_| panic!("worker thread {tid} panicked"));
         }
 
-        println!(
-            "{} writes, {} logical flushes in {:.2?}",
-            writes.load(Ordering::Relaxed),
-            flushes.load(Ordering::Relaxed),
-            start.elapsed()
-        );
-
-        let ops = threads * OPS_PER_THREAD;
         let elapsed = start.elapsed();
+        let writes = total_writes.load(Ordering::Relaxed);
+        let flushes = total_flushes.load(Ordering::Relaxed);
+        let ops = writes + flushes;
+
         println!(
-            "multi_threaded_stress: {ops} ops in {elapsed:.2?} ({:.0} ops/s)",
+            "multi_threaded_stress [{num_threads} threads]: \
+         {writes} writes, {flushes} flushes, {ops} total ops \
+         in {elapsed:.2?} ({:.0} ops/s)",
             ops as f64 / elapsed.as_secs_f64()
         );
     }
@@ -812,7 +904,7 @@ mod tests {
     /// maximising the race to seal and rotate.
     #[tokio::test]
     async fn hammer_seal_concurrent_rotation() {
-        let ring = Arc::new(FlushBufferRing::with_buffer_amount(RING_SIZE));
+        let ring = Arc::new(FlushBufferRing::with_buffer_amount(RING_SIZE, BUFFER_SIZE));
         let barrier = Arc::new(Barrier::new(NUM_THREADS_SMALL));
 
         let handles: Vec<_> = (0..NUM_THREADS_SMALL)
@@ -833,7 +925,7 @@ mod tests {
             .collect();
 
         for h in handles {
-             let _ = h.join().expect("hammer worker panicked");
+            let _ = h.join().expect("hammer worker panicked");
         }
     }
 
@@ -841,7 +933,7 @@ mod tests {
     /// and the offset is exactly 0.
     #[tokio::test]
     async fn buffer_fully_resets_after_flush() {
-        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE);
+        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE, BUFFER_SIZE);
 
         // Force a flush by filling the buffer exactly.
         let mut payload = make_payload("RESET", BUFFER_SIZE);
@@ -872,7 +964,7 @@ mod tests {
         use std::sync::Mutex;
 
         // A fresh, standalone buffer — no ring, no sealing race.
-        let buf = Arc::new(FlushBuffer::new_buffer(99));
+        let buf = Arc::new(FlushBuffer::new_buffer(99, BUFFER_SIZE));
         let seen: Arc<Mutex<HashSet<(usize, usize)>>> = Arc::new(Mutex::new(HashSet::new()));
 
         const THREADS: usize = 8;
@@ -908,5 +1000,41 @@ mod tests {
         for h in handles {
             h.join().expect("reserve worker panicked");
         }
+    }
+
+    // =============================================================================
+    // Delta Tests
+    // =============================================================================
+    #[tokio::test]
+    async fn delta_tests() {
+        let payload = b"hello world";
+        let delta = UpdateDelta::new(payload, 0x1234, 7, 99);
+
+        let ring = FlushBufferRing::with_buffer_amount(RING_SIZE, BUFFER_SIZE);
+
+        let mut writes = 0usize;
+        let mut flushes = 0usize;
+        let mut data_written = 0;
+
+        let mut i = 0;
+        loop {
+            if (data_written + delta.len()) > BUFFER_SIZE * RING_SIZE {
+                break;
+            }
+
+            data_written += payload.len();
+
+            match ring.put(&delta).await {
+                Ok(BufferMsg::SuccessfullWrite) => writes += 1,
+                Ok(BufferMsg::SuccessfullWriteFlush) => {
+                    writes += 1;
+                    flushes += 1;
+                }
+                other => panic!("single_threaded: unexpected {other:?}"),
+            }
+            i += 1;
+        }
+
+        println!("single_threaded: {writes} writes, {flushes} logical flushes — OK, data_written: {data_written}kb");
     }
 }
