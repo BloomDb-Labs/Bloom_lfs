@@ -2,6 +2,12 @@
 name = "bloom_lfs"
 version = "0.1.0"
 edition = "2021"
+description = "A high-performance, latch-free log-structured storage layer built for modern flash storage and multi-core systems."
+license = "GPL-3.0"
+repository = "https://github.com/BloomDb-Labs/Bloom_lfs"
+homepage = "https://github.com/BloomDb-Labs/Bloom_lfs"
+documentation = "https://docs.rs/bloom_lfs"
+readme = "Readme.md"
 
 exclude = ["benches/", "doc/", "loom-tests/", "test_store/"]
 
